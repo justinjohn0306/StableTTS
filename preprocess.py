@@ -5,6 +5,7 @@ from tqdm import tqdm
 import torch
 from torch.multiprocessing import Pool, set_start_method
 import torchaudio
+import argparse
 
 from config import MelConfig, TrainConfig
 from text.mandarin import chinese_to_cnm3
@@ -15,31 +16,44 @@ device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 @dataclass
 class DataConfig:
-    input_filelist_path = './filelists/filelist.txt' # a filelist contains 'audiopath | text'
-    output_filelist_path = './filelists/filelist.json' # path to save filelist
-    output_feature_path = './stableTTS_datasets' # path to save resampled audios and mel features
-    chinese = True # if use english, set the value tu False
-    resample = False # waveform is not used in training. However, it is used to calculate length for DistributedBucketSampler in training. Different samplerate or format may cause wrong bucket.
-            
-data_config = DataConfig()
+    input_filelist_path: str
+    output_filelist_path: str
+    output_feature_path: str
+    chinese: bool
+    resample: bool
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Process audio files.')
+parser.add_argument('--input_filelist_path', type=str, required=True, help='Path to the input file list.')
+parser.add_argument('--output_filelist_path', type=str, required=True, help='Path where the output file list will be saved.')
+parser.add_argument('--output_feature_path', type=str, required=True, help='Path where the resampled audios and mel features will be saved.')
+parser.add_argument('--chinese', type=bool, default=True, help='Process Chinese (True) or English (False).')
+parser.add_argument('--resample', type=bool, default=False, help='Whether to resample the audio files.')
+
+args = parser.parse_args()
+
+data_config = DataConfig(
+    input_filelist_path=args.input_filelist_path,
+    output_filelist_path=args.output_filelist_path,
+    output_feature_path=args.output_feature_path,
+    chinese=args.chinese,
+    resample=args.resample
+)
+
 train_config = TrainConfig()
 mel_config = MelConfig()
 
-input_filelist_path = data_config.input_filelist_path
-output_filelist_path = data_config.output_filelist_path
-output_feature_path = data_config.output_feature_path
-
 # Ensure output directories exist
-output_mel_dir = os.path.join(output_feature_path, 'mels')
+output_mel_dir = os.path.join(data_config.output_feature_path, 'mels')
 os.makedirs(output_mel_dir, exist_ok=True)
 if data_config.resample:
-    output_wav_dir = os.path.join(output_feature_path, 'waves')
+    output_wav_dir = os.path.join(data_config.output_feature_path, 'waves')
     os.makedirs(output_wav_dir, exist_ok=True)
-os.makedirs(os.path.dirname(output_filelist_path), exist_ok=True)
+os.makedirs(os.path.dirname(data_config.output_filelist_path), exist_ok=True)
 
 mel_extractor = LogMelSpectrogram(mel_config).to(device)
-g2p = chinese_to_cnm3 if data_config.chinese else english_to_ipa2 # now we only support chinese and english
-    
+g2p = chinese_to_cnm3 if data_config.chinese else english_to_ipa2
+
 def load_filelist(path) -> list:
     file_list = []
     with open(path, 'r', encoding='utf-8') as f:
@@ -48,11 +62,11 @@ def load_filelist(path) -> list:
             file_list.append((str(idx), audio_path, text))
     return file_list
 
-@ torch.inference_mode()
+@torch.inference_mode()
 def process_filelist(line) -> str:
     idx, audio_path, text = line
     audio = load_and_resample_audio(audio_path, mel_config.sample_rate, device=device) # shape: [1, time]
-    if audio is not None: 
+    if audio is not None:
         # get output path
         audio_name, _ = os.path.splitext(os.path.basename(audio_path))
         
@@ -66,26 +80,25 @@ def process_filelist(line) -> str:
                 audio_path = os.path.join(output_wav_dir, f'{idx}_{audio_name}.wav')
                 torchaudio.save(audio_path, audio.cpu(), mel_config.sample_rate)
             return json.dumps({'mel_path': output_mel_path, 'phone': phone, 'audio_path': audio_path, 'text': text}, ensure_ascii=False, allow_nan=False)
-            
 
 def main():
-    set_start_method('spawn') # CUDA must use spawn method
-    input_filelist = load_filelist(input_filelist_path)
+    set_start_method('spawn')  # CUDA must use spawn method
+    input_filelist = load_filelist(data_config.input_filelist_path)
     results = []
     
     with Pool(processes=2) as pool:
         for result in tqdm(pool.imap(process_filelist, input_filelist), total=len(input_filelist)):
             if result is not None:
-                results.append(f'{result}\n') 
-            
+                results.append(f'{result}\n')
+    
     # save filelist
-    with open(output_filelist_path, 'w', encoding='utf-8') as f:
+    with open(data_config.output_filelist_path, 'w', encoding='utf-8') as f:
         f.writelines(results)
-    print(f"filelist file has been saved to {output_filelist_path}")
+    print(f"filelist file has been saved to {data_config.output_filelist_path}")
 
 # faster and use much less CPU
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
-    
+
 if __name__ == '__main__':
     main()
